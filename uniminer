@@ -1,0 +1,504 @@
+#!/usr/bin/python
+
+###########################################################################
+# UNIMINER 
+# By Daniel Dean 2008
+# Description: Parses binary Unidata files into manageable text files for 
+# 			   porting to other databases.
+#
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+###########################################################################
+
+import os
+import binascii
+import time
+import datetime
+import types
+import re
+
+true = 1
+false = 0
+SEEK_CUR = 1
+
+class Uniminer:
+
+	uniminer_version = "1.2"
+
+	errmsg = {    	1:  "Invalid option.",
+				    2:  "Invalid output option.",
+				    3:  "Incorrect usage.",
+				    4:  "Invalid input file.",
+				    5:  "Input file is not readable.",
+				    6:  "Input file does not exist.",
+				    10: "Unable to open input file.",
+				    12: "Unable to open output file.",
+				    19: "Zero length fread buffer.",
+				    20: "Input file is not a unidata hash.",
+				    23: "Datablock too large.",
+				    27: "Unable to open dictionary file for column headers.",
+				    29: "Invalid output option.",
+				    31: "Unable to open dictionary output file.",
+				    37: "Unable to process dictionary file." }
+	
+
+	opts = ['h', 'c', 'm']
+	
+	out_types = ['d', 'f', 'o', 'i', 't', 's']
+	
+	fp = 0
+	
+	outfp = 0
+	
+	totals = {}
+	
+	currentGroup = 0
+
+	start_time = 0
+	
+	columns = {}
+	
+	columndates = []
+	
+	fileIsDict = false
+	
+	#-----------------------------------------------------------------------------
+	def showUsage(self):
+		print 'Usage: uniminer [output type] [options] [data file]'
+		print 
+		print '           output types (required, 1 only):'
+		print '                     d - create directory named after import file, where each file within corresponds to one record'
+		print '                     s - create single file, each record on one line using the original char 253 and 254 codes to separate fields'
+		print '                     t - create single file, each record on one line using semicolons to separate fields and brackets to separate mutlivalues'
+		print '                     f - create single file, each record on one line using commas to separate fields and brackets to separate mutlivalues'
+		print '                     o - output records to screen'
+		print '                     i - process file status only'
+		print 
+		print '           options (optional, 1 or more:'
+		print '                     h - try to find column names in D_<filename> and use as first row in output file'
+		print '                     c - perform date conversions from internal unidata to standard date (implies option h'
+		print '                     m - in multivalued fields, retain only the 1st value'
+		print 
+
+	#-----------------------------------------------------------------------------
+	def showError(self, code):
+		err = "Unknown error."
+		if self.errmsg.has_key(code):
+			err = self.errmsg[code]
+		print "[ ERROR " + str(code) + " ] " + err
+
+
+	#-----------------------------------------------------------------------------
+	def bin2dec(self, binval):
+		if binval != '':
+			return int(binascii.b2a_hex(binval), 16)
+		else:
+			return ''
+
+	#-----------------------------------------------------------------------------
+	def readec(self, bytes):
+		return self.bin2dec(self.fp.read(bytes))
+		
+	#-----------------------------------------------------------------------------
+	def validateOptions(self, opt):
+		for i in range (0, len(opt)):
+			if not opt[i:i+1] in self.opts:
+				return false
+		return true
+
+	#-----------------------------------------------------------------------------
+	def crash(self, code):
+		self.showError(code)
+		self.showUsage()
+		return false
+
+
+	#-----------------------------------------------------------------------------
+	def validateParams(self, argc, argv):
+		
+		if argc < 3 or argc > 4:
+			return self.crash(3)
+
+		if len(argv[1]) != 2:
+			return self.crash(29)
+
+		output = argv[1][1:]
+		if not output in self.out_types:
+			return self.crash(2)
+
+		if argc == 3:
+			filename = argv[2]
+		else:
+			filename = argv[3]
+			if not self.validateOptions(argv[2][1:]):
+				return self.crash(1)
+
+		if not os.path.exists(filename):
+			return self.crash(6)
+
+		if os.path.isdir(filename) or not os.path.isfile(filename):
+			return self.crash(4)
+
+		if not os.access(filename, os.R_OK):
+			return self.crash(5)
+
+		return true
+
+	#-----------------------------------------------------------------------------
+	def getFileGroupSize(self): 
+		self.fp.seek(19)
+		s = (self.readec(1) + 1) * 1024
+		return s
+
+	#-----------------------------------------------------------------------------
+	def groupContainsKeys(self, seek_to):
+		self.fp.seek(seek_to + 16)
+		c = binascii.b2a_hex(self.fp.read(1))
+		if c != '48':  # Hash chunks with key names will contain this byte at offset+16.
+			return false
+			
+		self.fp.seek(seek_to + 28)
+		d = binascii.b2a_hex(self.fp.read(4))
+		if d != "01000000":  # To help validate, use this other common occurrence at offset+28.
+			return false
+	
+		return true
+
+	#-----------------------------------------------------------------------------
+	def verifyFile(self):
+		blk = self.getFileGroupSize()
+
+		if not self.groupContainsKeys(blk):
+			return self.crash(20)
+
+  		self.fp.seek(52)
+  		c = binascii.b2a_hex(self.fp.read(4))
+  		if c != "ffc08100": # Common identifier at offset 52.
+			return self.crash(20)
+			
+		return true
+		
+	#-----------------------------------------------------------------------------
+	def replaceControlCodes(self, text, c253, c254, c255):
+		d = text.replace(chr(253), c253)
+		d = d.replace(chr(254), c254)
+		d = d.replace(chr(255), c255)
+		return d
+
+	#-----------------------------------------------------------------------------
+	def hasOption(self, has, options):
+		for i in range(0,len(options)):
+			if options[i:i+1] == has:
+				return true
+				
+		return false
+
+	#-----------------------------------------------------------------------------
+	def processOptionsOnRecord(self, data, conv):
+		d = data
+		if self.hasOption('m', conv):
+			d = d.replace(chr(253) + "[^" + chr(254) + "]*" + chr(254), chr(254))
+			
+		if not self.fileIsDict:
+			if self.hasOption('h', conv):
+				arr = d.split(chr(254))
+				for i in range(0, len(arr)):
+					if self.columns[i+1] in self.columndates:
+						if arr[i] != "" and re.search('^[-0123456789]*$', arr[i]): # Don't convert the field if somehow it has text
+							if (40000 > int(arr[i]) > -20000): # the date functions will fail if the timestamp doesn't fall within a certain range
+								arr[i] = (int(arr[i]) - 732) * 60 * 60 * 24
+								arr[i] = time.strftime('%m/%d/%y', time.gmtime(arr[i]))
+				d = chr(254).join(arr)
+			
+		return d
+
+
+	#-----------------------------------------------------------------------------
+	def getColumnNames(self, filename):
+		arr = {}
+		inp = open (filename,"r")
+		largest_key = 0
+		
+		if not inp:
+			return self.crash(31)
+
+		for line in inp.readlines():
+			record = line.split(chr(9))
+			if record[1][0:1] == 'D' or record[1][0:1] == 'd':
+				arr[int(record[2])] = record[0]
+				if record[3][0:1] == 'D' or record[3][0:1] == 'd':
+					self.columndates.append(record[0])
+				if largest_key < int(record[2]):
+					largest_key = int(record[2])
+			
+		text = ''
+		for i in range(0,largest_key+1):
+			if arr.has_key(i):
+				self.columns[i] = arr[i]
+				text += arr[i] + chr(9)
+			else:
+				self.columns[i] = ''
+				text += chr(9)
+  
+		return text
+
+	#-----------------------------------------------------------------------------
+	def cleanUp(self):
+		if self.outfp:
+			self.fp.close()
+			self.outfp = 0
+		if self.fp:
+			self.fp.close()
+			self.fp = 0
+
+	#-----------------------------------------------------------------------------
+	def initOutputFile(self, tableName, op):
+
+		if op == 'd':
+			dirname = tableName + ".out.dir"
+			if not self.outfp:
+				if not os.path.exists(dir):
+					os.mkdir(dir)
+					self.outfp = open(dirname, "r")
+			if self.outfp:
+				return self.crash(14)
+		elif op == 's' or op == 'f' or op == 't':
+			if not self.outfp: 
+				self.outfp = open(tableName + ".out.txt", "w")
+				if not self.outfp:
+					return self.crash(12)
+		
+		return true
+
+
+	#-----------------------------------------------------------------------------
+	def processRecord(self, tableName, recordName, data, op, conv):
+		ufp = 0
+  
+		if conv != "": # We need to parse dates, remove multivalues, etc. if necessary.
+			dataConv = self.processOptionsOnRecord(data, conv)
+		else:
+			dataConv = data
+
+
+		if op == 'd':
+			tfp = open(dirname + "/" + recordName, "w")
+			if not tfp:
+				return self.crash(12)
+			dataOut = self.replaceControlCodes(dataConv, "]", chr(10), "")
+			ufp = tfp
+		elif op == 't':
+			dataOut = recordName + ";" + self.replaceControlCodes(dataConv, "]", ";", "") + chr(10)
+			ufp = self.outfp
+		elif op == 'f':
+			dataConv = dataConv.replace(chr(9),   " ")
+			dataOut = recordName + chr(9) + self.replaceControlCodes(dataConv, "]", chr(9), "") + chr(10)
+			ufp = self.outfp
+		elif op == 's':
+			dataOut = recordName + ";" + dataConv + chr(10)
+			ufp = self.outfp
+		else:
+			dataOut = recordName.ljust(32) + " --> " + self.replaceControlCodes(dataConv, "]", " ; ", "")
+			
+		if op == "o":
+			print dataOut
+		else:
+			ufp.write(dataOut)
+
+		return true
+
+	#-----------------------------------------------------------------------------
+	def clearTotals(self):
+		self.totals['records'] = 0
+		self.totals['freeSpace'] = 0
+		self.totals['recordBytes'] = 0
+		self.totals['headerBytes'] = 0
+		self.totals['dataGroups'] = 0
+		self.totals['keyGroups'] = 0
+		self.totals['lastGroupNumber'] = 0
+		self.totals['overflowGroups'] = 0
+		self.totals['initGroupCount'] = 0
+		self.totals['fileSize'] = 0
+		
+	#-----------------------------------------------------------------------------
+	def nextGroup(self, nextLoc):
+		self.fp.seek(nextLoc + 8)
+		groupNumber = self.readec(4)  
+		if groupNumber > self.totals['lastGroupNumber']:
+			self.totals['lastGroupNumber'] = groupNumber
+		else:
+			self.totals['overflowGroups'] +=1
+
+	#-----------------------------------------------------------------------------
+	def processFile(self, filename, output, opt, dicts=""):
+		self.clearTotals()
+		
+		statinfo = os.stat(filename)
+		self.totals['fileSize'] = statinfo.st_size
+
+		self.fp = open(filename, 'r') # Our input file.
+		if not self.fp:
+			return self.crash(10)
+
+		if not self.verifyFile(): # Make sure it's a compatible Unidata file.
+			return false
+
+		if not self.initOutputFile(filename, output):
+			return false
+
+		if dicts != '':
+			if output == 'o':
+				print dicts
+			else:
+				self.outfp.write(dicts + "\n")
+
+		self.blockSize = self.getFileGroupSize()
+		done = false
+		self.currentGroup = 0
+
+		self.totals['headerBytes'] = self.blockSize # Set to blockSize to account for the first group of unused space.
+
+		self.fp.seek(0)
+		self.totals['initGroupCount'] = self.readec(4)
+
+		while not done: # Iterate thru each hash chunk
+			self.currentGroup += 1
+			nextLoc = self.blockSize * self.currentGroup
+
+			self.nextGroup(nextLoc)
+			
+			if nextLoc < self.totals['fileSize']:
+
+				self.fp.seek(nextLoc + 4)
+				freeBytes = self.readec(2)
+				self.totals['freeSpace'] += freeBytes
+
+				if self.groupContainsKeys(nextLoc): # We want to ignore hash chunks that only contain record data.
+
+					self.fp.seek(nextLoc + 20)
+					keyCount = self.readec(2)
+
+					self.fp.seek(nextLoc + 24)
+					keysStart = self.readec(2) + nextLoc # We'll read backward from this byte to get the Key names.
+
+					self.totals['headerBytes'] += (keysStart - nextLoc)
+
+					if (nextLoc + self.blockSize) == (freeBytes + keysStart):
+						self.totals['keyGroups'] += 1
+
+					currentByte = keysStart
+					nextDataLoc = nextLoc + 32
+
+					for i in range(0, keyCount): # // Iterate thru each key in the current hash chunk.
+						self.totals['records'] += 1
+						self.fp.seek(currentByte-1)
+						rlen = self.readec(1)
+						if rlen == 0: # This is to protect from accidental overruns.
+							return self.crash(19)
+
+						self.fp.seek( (-1* rlen)-1, SEEK_CUR) #Read backward len bytes to get Key name.
+						key = self.fp.read(rlen)
+						currentByte -= (rlen+1)
+
+						self.fp.seek(nextDataLoc) 
+						dataAdd = self.readec(4) # Location of the record to read
+						dataLen = self.readec(4) # Size of the record to read
+						self.totals['recordBytes'] += dataLen
+						nextDataLoc += 8
+
+						if output != "i":
+							if dataLen < 1000000: # // No single record should be larger than 1 Megabyte.
+								self.fp.seek(dataAdd)
+								dataBlock = self.fp.read(dataLen)
+
+								if not self.processRecord(filename, key, dataBlock, output, opt): # write out the record data according to the appropriate option.
+									return false
+								
+							else: # If we find a record with too large a size, it's probably a corrupted or incompatible hash file, so quit.
+								return self.crash(23) 
+							
+				else:
+					self.totals['headerBytes'] += 12
+					self.totals['dataGroups'] += 1
+					# We're in a section without keys, so do nothing.
+						
+			else: # We've reached the end of the file.
+				done = true
+				
+		self.cleanUp()
+		return true
+
+	#-----------------------------------------------------------------------------
+	def startup(self):
+		self.start_time = time.time()
+		print
+		print "Uniminer v." + self.uniminer_version 
+		
+	#-----------------------------------------------------------------------------
+	def shutdown(self):
+		print 
+		print '-- File Status -------- '
+		print 'Number of Records     : ' + str(self.totals['records'])
+		print 'Initial Group Count   : ' + str(self.totals['initGroupCount'])
+		print 'Actual Group Count    : ' + str(self.currentGroup+1)
+		print 'Group Size in Bytes   : ' + str(self.blockSize)
+		print 'Data-only Groups      : ' + str(self.totals['dataGroups'])
+		print 'Key-only Groups       : ' + str(self.totals['keyGroups'])
+		print 'Overflow Groups       : ' + str(self.totals['overflowGroups'])
+		print  
+		print 'File Size in Bytes    : '+ str(self.totals['fileSize'])
+		print 'Total Record Bytes    : '+ str(self.totals['recordBytes'])
+		print 'Total Header Bytes    : '+ str(self.totals['headerBytes'])
+		print 'Free Space in Bytes   : '+ str(self.totals['freeSpace'])
+		print 'Bytes unnacounted for : '+ str(self.totals['fileSize'] - self.totals['recordBytes'] - self.totals['headerBytes'] - self.totals['freeSpace'])
+		print 
+
+		totalTime = time.time() - self.start_time
+		print "Finished. Total time : " + str(totalTime) + " seconds."
+
+	#=============================================================================
+	def main(self, argv, argc):
+		self.startup()
+
+		if not self.validateParams(argc, argv):
+			return false
+
+		output = argv[1][1:2] # strip the dash from the output param
+		opt = ""
+		if (argc == 3): # conversion options are optional, so handle 2 and 3 paramater combinations
+			filename = argv[2]
+		else:
+			filename = argv[3]
+			opt = argv[2][1:len(argv[2])-1] 
+
+		dicts = ""
+		if self.hasOption('h', opt): # grab dictionary file and use it to make a header row in the data output file
+			self.fileIsDict = true
+			if not self.processFile("D_" + filename, output, opt):
+				return self.crash(37)
+			else:
+				dicts = self.getColumnNames("D_" + filename + ".out.txt")
+				
+		self.fileIsDict = false
+		self.processFile(filename, output, opt, dicts)
+
+		self.shutdown()		
+		return true
+
+###################################################################################
+
+u = Uniminer()
+
+os.sys.exit(u.main(os.sys.argv, len(os.sys.argv)))
